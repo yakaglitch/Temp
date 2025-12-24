@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Umweltmesssystem – Live-Ansicht</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+        background: #f7f7f7;
+        color: #1f1f1f;
+      }
+      .card {
+        background: white;
+        padding: 1.5rem;
+        border-radius: 0.75rem;
+        box-shadow: 0 0.25rem 0.75rem rgba(0, 0, 0, 0.08);
+        max-width: 28rem;
+      }
+      .value {
+        font-size: 1.75rem;
+        margin: 0.25rem 0 1rem;
+      }
+      .label {
+        font-size: 0.9rem;
+        color: #666;
+      }
+      .timestamp {
+        font-size: 0.85rem;
+        color: #666;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Live-Ansicht</h1>
+      <div class="label">Temperatur</div>
+      <div class="value" id="temp">–</div>
+      <div class="label">Luftdruck</div>
+      <div class="value" id="press">–</div>
+      <div class="label">Luftfeuchte</div>
+      <div class="value" id="hum">–</div>
+      <div class="timestamp" id="ts">Letztes Update: –</div>
+    </div>
+
+    <script>
+      async function loadLive() {
+        try {
+          const response = await fetch("/data/live.json", { cache: "no-store" });
+          if (!response.ok) {
+            return;
+          }
+          const data = await response.json();
+          document.getElementById("temp").textContent = `${data.temperature_c.toFixed(2)} °C`;
+          document.getElementById("press").textContent = `${data.pressure_hpa.toFixed(2)} hPa`;
+          document.getElementById("hum").textContent = `${data.humidity_rh.toFixed(2)} %`;
+          document.getElementById("ts").textContent = `Letztes Update: ${data.timestamp}`;
+        } catch (error) {
+          console.warn("Live-Daten nicht verfügbar", error);
+        }
+      }
+
+      loadLive();
+      setInterval(loadLive, 5000);
+    </script>
+  </body>
+</html>
