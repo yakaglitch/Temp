@@ -1,0 +1,500 @@
+/*
+ * status2.c
+ *
+ * - ECHTER BME280 Read via /dev/i2c-1 (Adresse 0x76 standard; ggf. anpassen)
+ * - 50 Hz Loop (20 ms)
+ * - SMOOTH(50) (Moving Average) wird bei jedem Tick aktualisiert
+ * - CLI-Scrolling-Diagramme (letzte 60s) mit 1 Punkt pro Sekunde (Smooth-Wert):
+ *   - Temperatur (Smooth)
+ *   - Druck (Smooth)
+ *   - Luftfeuchte (Smooth)
+ *
+ * Kompilieren:
+ *   gcc -O2 -Wall status2.c -o status2 -lm
+ *
+ * Start:
+ *   ./status2
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <signal.h>
+#include <time.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/i2c-dev.h>
+#include <math.h>
+
+/* ---------------- Einstellungen ---------------- */
+#define SAMPLE_HZ        50
+#define PERIOD_NS        (1000000000L / SAMPLE_HZ)  // 20 ms
+#define WINDOW           3000                          // Smooth über 50 Samples = 1 Sekunde
+#define HIST_SECONDS     120                          // Diagramm: letzte 60 Sekunden
+#define CHART_HEIGHT     14                          // Höhe je Diagramm
+
+#define I2C_DEV          "/dev/i2c-1"
+#define BME280_ADDR      0x76          // ggf. 0x77, falls dein Sensor so eingestellt ist
+
+/* BME280 Register */
+#define REG_ID           0xD0
+#define REG_RESET        0xE0
+#define REG_CTRL_HUM     0xF2
+#define REG_CTRL_MEAS    0xF4
+#define REG_CONFIG       0xF5
+#define REG_PRESS_MSB    0xF7  // F7..FE: P(3), T(3), H(2)
+
+#define BME280_CHIP_ID   0x60
+
+/* Verhalten bei Sensorfehler: Smooth einfrieren (letzter gültiger Stand) */
+#define FREEZE_SMOOTH_ON_ERROR 1
+
+static volatile sig_atomic_t keep_running = 1;
+static void on_sigint(int sig) { (void)sig; keep_running = 0; }
+
+/* ---------------- Monotonic Sleep (absolut) ---------------- */
+static inline int64_t ts_to_ns(const struct timespec *t) {
+    return (int64_t)t->tv_sec * 1000000000LL + (int64_t)t->tv_nsec;
+}
+static inline struct timespec ns_to_ts(int64_t ns) {
+    struct timespec t;
+    t.tv_sec  = (time_t)(ns / 1000000000LL);
+    t.tv_nsec = (long)(ns % 1000000000LL);
+    return t;
+}
+static void sleep_until(int64_t target_ns) {
+    struct timespec ts = ns_to_ts(target_ns);
+    while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR) {
+        if (!keep_running) break;
+    }
+}
+
+/* ---------------- Moving Average (Ringpuffer) ---------------- */
+typedef struct {
+    double buf[WINDOW];
+    int idx;
+    int count;
+    double sum;
+} MovingAvg;
+
+static void ma_init(MovingAvg *m) { memset(m, 0, sizeof(*m)); }
+static void ma_add(MovingAvg *m, double v) {
+    if (m->count < WINDOW) {
+        m->buf[m->idx] = v;
+        m->sum += v;
+        m->idx = (m->idx + 1) % WINDOW;
+        m->count++;
+    } else {
+        double old = m->buf[m->idx];
+        m->buf[m->idx] = v;
+        m->sum += (v - old);
+        m->idx = (m->idx + 1) % WINDOW;
+    }
+}
+static inline double ma_mean(const MovingAvg *m) {
+    return (m->count == 0) ? NAN : (m->sum / (double)m->count);
+}
+
+/* ---------------- Terminal Helpers ---------------- */
+static int get_term_cols(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return (int)ws.ws_col;
+    return 120;
+}
+
+/* Zeitstempel HH:MM:SS.mmm (Realtime) */
+static void format_time_ms(char *out, size_t out_sz) {
+    struct timespec rt;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    struct tm tm_now;
+    localtime_r(&rt.tv_sec, &tm_now);
+    int ms = (int)(rt.tv_nsec / 1000000L);
+    snprintf(out, out_sz, "%02d:%02d:%02d.%03d",
+             tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec, ms);
+}
+
+/* Eine Zeile sicher (truncate/pad, kein wrap) */
+static void print_one_line_fixed(const char *s) {
+    int cols = get_term_cols();
+    if (cols < 10) cols = 10;
+
+    fputs("\r\033[2K", stdout);  // Zeile löschen
+    int maxlen = cols - 1;       // Wrap vermeiden
+    int len = (int)strlen(s);
+
+    if (len > maxlen) {
+        fwrite(s, 1, (size_t)maxlen, stdout);
+    } else {
+        fputs(s, stdout);
+        for (int i = len; i < maxlen; i++) fputc(' ', stdout);
+    }
+    fflush(stdout);
+}
+
+/* ---------------- I2C Helpers ---------------- */
+static int i2c_open_set_addr(const char *dev, int addr) {
+    int fd = open(dev, O_RDWR);
+    if (fd < 0) return -1;
+    if (ioctl(fd, I2C_SLAVE, addr) < 0) {
+        close(fd);
+        return -2;
+    }
+    return fd;
+}
+
+static int i2c_read_u8(int fd, uint8_t reg, uint8_t *out) {
+    if (write(fd, &reg, 1) != 1) return -1;
+    uint8_t v = 0;
+    if (read(fd, &v, 1) != 1) return -2;
+    *out = v;
+    return 0;
+}
+
+static int i2c_write_u8(int fd, uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = { reg, val };
+    if (write(fd, buf, 2) != 2) return -1;
+    return 0;
+}
+
+static int i2c_read_block(int fd, uint8_t start_reg, uint8_t *buf, size_t len) {
+    if (write(fd, &start_reg, 1) != 1) return -1;
+    ssize_t r = read(fd, buf, len);
+    if (r != (ssize_t)len) return -2;
+    return 0;
+}
+
+/* ---------------- BME280 Calibration + Compensation ---------------- */
+typedef struct {
+    uint16_t dig_T1; int16_t dig_T2; int16_t dig_T3;
+    uint16_t dig_P1; int16_t dig_P2; int16_t dig_P3; int16_t dig_P4; int16_t dig_P5;
+    int16_t  dig_P6; int16_t dig_P7; int16_t dig_P8; int16_t dig_P9;
+    uint8_t  dig_H1; int16_t dig_H2; uint8_t dig_H3; int16_t dig_H4; int16_t dig_H5; int8_t dig_H6;
+    int32_t  t_fine;
+} bme280_calib_t;
+
+static uint16_t u16le(const uint8_t *b) { return (uint16_t)b[0] | ((uint16_t)b[1] << 8); }
+static int16_t  s16le(const uint8_t *b) { return (int16_t)((uint16_t)b[0] | ((uint16_t)b[1] << 8)); }
+
+static int bme280_read_calib(int fd, bme280_calib_t *c) {
+    uint8_t cal1[26];
+    uint8_t cal2[7];
+    if (i2c_read_block(fd, 0x88, cal1, sizeof(cal1)) != 0) return -1;
+    if (i2c_read_block(fd, 0xE1, cal2, sizeof(cal2)) != 0) return -2;
+
+    c->dig_T1 = u16le(&cal1[0]);
+    c->dig_T2 = s16le(&cal1[2]);
+    c->dig_T3 = s16le(&cal1[4]);
+
+    c->dig_P1 = u16le(&cal1[6]);
+    c->dig_P2 = s16le(&cal1[8]);
+    c->dig_P3 = s16le(&cal1[10]);
+    c->dig_P4 = s16le(&cal1[12]);
+    c->dig_P5 = s16le(&cal1[14]);
+    c->dig_P6 = s16le(&cal1[16]);
+    c->dig_P7 = s16le(&cal1[18]);
+    c->dig_P8 = s16le(&cal1[20]);
+    c->dig_P9 = s16le(&cal1[22]);
+
+    c->dig_H1 = cal1[25];
+    c->dig_H2 = s16le(&cal2[0]);
+    c->dig_H3 = cal2[2];
+
+    c->dig_H4 = (int16_t)((cal2[3] << 4) | (cal2[4] & 0x0F));
+    c->dig_H5 = (int16_t)((cal2[5] << 4) | (cal2[4] >> 4));
+    c->dig_H6 = (int8_t)cal2[6];
+
+    c->t_fine = 0;
+    return 0;
+}
+
+/* Bosch Reference Compensation */
+static int32_t bme280_comp_temp_x100(bme280_calib_t *c, int32_t adc_T) {
+    int32_t var1 = ((((adc_T >> 3) - ((int32_t)c->dig_T1 << 1))) * ((int32_t)c->dig_T2)) >> 11;
+    int32_t var2 = (((((adc_T >> 4) - ((int32_t)c->dig_T1)) * ((adc_T >> 4) - ((int32_t)c->dig_T1))) >> 12) *
+                     ((int32_t)c->dig_T3)) >> 14;
+    c->t_fine = var1 + var2;
+    return (c->t_fine * 5 + 128) >> 8; // *100
+}
+
+static uint32_t bme280_comp_press_q24_8(bme280_calib_t *c, int32_t adc_P) {
+    int64_t var1 = ((int64_t)c->t_fine) - 128000;
+    int64_t var2 = var1 * var1 * (int64_t)c->dig_P6;
+    var2 = var2 + ((var1 * (int64_t)c->dig_P5) << 17);
+    var2 = var2 + (((int64_t)c->dig_P4) << 35);
+    var1 = ((var1 * var1 * (int64_t)c->dig_P3) >> 8) + ((var1 * (int64_t)c->dig_P2) << 12);
+    var1 = (((((int64_t)1) << 47) + var1) * (int64_t)c->dig_P1) >> 33;
+    if (var1 == 0) return 0;
+
+    int64_t p = 1048576 - adc_P;
+    p = (((p << 31) - var2) * 3125) / var1;
+    var1 = ((int64_t)c->dig_P9 * (p >> 13) * (p >> 13)) >> 25;
+    var2 = ((int64_t)c->dig_P8 * p) >> 19;
+    p = ((p + var1 + var2) >> 8) + (((int64_t)c->dig_P7) << 4);
+    return (uint32_t)p; // Q24.8 Pa
+}
+
+static uint32_t bme280_comp_hum_x1024(bme280_calib_t *c, int32_t adc_H) {
+    int32_t v_x1_u32r;
+    v_x1_u32r = (c->t_fine - ((int32_t)76800));
+    v_x1_u32r = (((((adc_H << 14) - (((int32_t)c->dig_H4) << 20) - (((int32_t)c->dig_H5) * v_x1_u32r)) +
+                   ((int32_t)16384)) >> 15) *
+                 (((((((v_x1_u32r * ((int32_t)c->dig_H6)) >> 10) *
+                      (((v_x1_u32r * ((int32_t)c->dig_H3)) >> 11) + ((int32_t)32768))) >> 10) +
+                    ((int32_t)2097152)) * ((int32_t)c->dig_H2) + 8192) >> 14));
+    v_x1_u32r = (v_x1_u32r - (((((v_x1_u32r >> 15) * (v_x1_u32r >> 15)) >> 7) * ((int32_t)c->dig_H1)) >> 4));
+    v_x1_u32r = (v_x1_u32r < 0 ? 0 : v_x1_u32r);
+    v_x1_u32r = (v_x1_u32r > 419430400 ? 419430400 : v_x1_u32r);
+    return (uint32_t)(v_x1_u32r >> 12); // *1024
+}
+
+/* Init: Normal mode, osrs=1 (schnell) */
+static int bme280_init(int fd, bme280_calib_t *cal) {
+    uint8_t id = 0;
+    if (i2c_read_u8(fd, REG_ID, &id) != 0) return -1;
+    if (id != BME280_CHIP_ID) return -2;
+    if (bme280_read_calib(fd, cal) != 0) return -3;
+
+    (void)i2c_write_u8(fd, REG_RESET, 0xB6);
+    usleep(5000);
+
+    if (i2c_write_u8(fd, REG_CONFIG, 0x00) != 0) return -4;      // filter off
+    if (i2c_write_u8(fd, REG_CTRL_HUM, 0x01) != 0) return -5;    // hum x1
+    if (i2c_write_u8(fd, REG_CTRL_MEAS, 0x27) != 0) return -6;   // temp x1, press x1, normal
+    return 0;
+}
+
+static int bme280_read_sample(int fd, bme280_calib_t *cal, double *t_c, double *h_rh, double *p_hpa) {
+    uint8_t data[8];
+    if (i2c_read_block(fd, REG_PRESS_MSB, data, sizeof(data)) != 0) return -1;
+
+    int32_t adc_P = (int32_t)((data[0] << 12) | (data[1] << 4) | (data[2] >> 4));
+    int32_t adc_T = (int32_t)((data[3] << 12) | (data[4] << 4) | (data[5] >> 4));
+    int32_t adc_H = (int32_t)((data[6] << 8) | data[7]);
+
+    int32_t  T_x100  = bme280_comp_temp_x100(cal, adc_T);
+    uint32_t P_q24_8 = bme280_comp_press_q24_8(cal, adc_P);
+    uint32_t H_x1024 = bme280_comp_hum_x1024(cal, adc_H);
+
+    double T = (double)T_x100 / 100.0;
+    double Pa = (double)P_q24_8 / 256.0;
+    double hPa = Pa / 100.0;
+    double RH = (double)H_x1024 / 1024.0;
+
+    *t_c = T;
+    *p_hpa = hPa;
+    *h_rh = RH;
+    return 0;
+}
+
+/* ---------------- Diagramm (60s, 1 Punkt/s) ---------------- */
+static void hist_push(double *hist, int *idx, int *count, double v) {
+    hist[*idx] = v;
+    *idx = (*idx + 1) % HIST_SECONDS;
+    if (*count < HIST_SECONDS) (*count)++;
+}
+
+static void hist_min_max(const double *hist, int idx, int count, double *out_min, double *out_max) {
+    if (count <= 0) { *out_min = 0.0; *out_max = 1.0; return; }
+    double mn = 0.0, mx = 0.0;
+    for (int i = 0; i < count; i++) {
+        int pos = (idx - count + i);
+        while (pos < 0) pos += HIST_SECONDS;
+        pos %= HIST_SECONDS;
+        double v = hist[pos];
+        if (i == 0) mn = mx = v;
+        else { if (v < mn) mn = v; if (v > mx) mx = v; }
+    }
+    double span = mx - mn;
+    if (span < 1e-9) { mn -= 0.5; mx += 0.5; }
+    else { mn -= 0.05 * span; mx += 0.05 * span; }
+    *out_min = mn; *out_max = mx;
+}
+
+static int value_to_row(double v, double mn, double mx, int height) {
+    if (mx <= mn) return height - 1;
+    double t = (v - mn) / (mx - mn);
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int r = (int)lround((1.0 - t) * (height - 1));
+    if (r < 0) r = 0;
+    if (r >= height) r = height - 1;
+    return r;
+}
+
+static void draw_chart(const char *title, const double *hist, int idx, int count, const char *unit) {
+    double mn, mx;
+    hist_min_max(hist, idx, count, &mn, &mx);
+
+    printf("%s (last %ds, 1 point/s, autoscale %.2f..%.2f %s)\n",
+           title, HIST_SECONDS, mn, mx, unit);
+
+    for (int r = 0; r < CHART_HEIGHT; r++) {
+        double y = mx - (mx - mn) * ((double)r / (double)(CHART_HEIGHT - 1));
+        printf("%8.2f | ", y);
+
+        for (int i = 0; i < HIST_SECONDS; i++) {
+            int pos = (idx + i) % HIST_SECONDS;
+            char ch = ' ';
+
+            if (count > 0) {
+                int oldest_pos = (idx - count);
+                while (oldest_pos < 0) oldest_pos += HIST_SECONDS;
+                oldest_pos %= HIST_SECONDS;
+
+                int end = (idx - 1);
+                while (end < 0) end += HIST_SECONDS;
+                end %= HIST_SECONDS;
+
+                int in_range = 0;
+                if (count == HIST_SECONDS) in_range = 1;
+                else if (oldest_pos <= end) {
+                    if (pos >= oldest_pos && pos <= end) in_range = 1;
+                } else {
+                    if (pos >= oldest_pos || pos <= end) in_range = 1;
+                }
+
+                if (in_range) {
+                    double v = hist[pos];
+                    int vr = value_to_row(v, mn, mx, CHART_HEIGHT);
+                    if (vr == r) ch = '*';
+                }
+            }
+            putchar(ch);
+        }
+        putchar('\n');
+    }
+
+    printf("         + ");
+    for (int i = 0; i < HIST_SECONDS; i++) putchar('-');
+    printf("\n          older <----------------------------------------------> newer\n\n");
+}
+
+static void redraw_charts(const double *t_hist, int t_idx, int t_count,
+                          const double *p_hist, int p_idx, int p_count,
+                          const double *h_hist, int h_idx, int h_count) {
+    fputs("\033[2;1H\033[J", stdout);
+    draw_chart("TEMP smooth", t_hist, t_idx, t_count, "C");
+    draw_chart("PRES smooth", p_hist, p_idx, p_count, "hPa");
+    draw_chart("HUM  smooth", h_hist, h_idx, h_count, "%");
+    fflush(stdout);
+}
+
+/* ---------------- Main ---------------- */
+int main(void) {
+    signal(SIGINT, on_sigint);
+
+    /* Terminal: Wrap aus, Cursor aus, Screen clear */
+    fputs("\033[?7l\033[?25l\033[2J\033[H", stdout);
+    fflush(stdout);
+
+    int fd = i2c_open_set_addr(I2C_DEV, BME280_ADDR);
+    bme280_calib_t cal;
+    memset(&cal, 0, sizeof(cal));
+
+    int init_rc = 0;
+    if (fd < 0) init_rc = -100;
+    else init_rc = bme280_init(fd, &cal);
+
+    MovingAvg maT, maH, maP;
+    ma_init(&maT); ma_init(&maH); ma_init(&maP);
+
+    /* 60s History (1 Punkt pro Sekunde) */
+    double t_hist[HIST_SECONDS]; memset(t_hist, 0, sizeof(t_hist));
+    double p_hist[HIST_SECONDS]; memset(p_hist, 0, sizeof(p_hist));
+    double h_hist[HIST_SECONDS]; memset(h_hist, 0, sizeof(h_hist));
+    int t_idx = 0, t_count = 0;
+    int p_idx = 0, p_count = 0;
+    int h_idx = 0, h_count = 0;
+
+    struct timespec mono0;
+    clock_gettime(CLOCK_MONOTONIC, &mono0);
+    int64_t next_ns = ts_to_ns(&mono0);
+
+    uint64_t sample = 0;
+    uint64_t total_errors = 0;
+
+    double raw_t = NAN, raw_h = NAN, raw_p = NAN;
+    double sm_t  = NAN, sm_h  = NAN, sm_p  = NAN;
+
+    char ts_buf[32];
+    char line[512];
+
+    int tick_1hz = SAMPLE_HZ;
+
+    redraw_charts(t_hist, t_idx, t_count, p_hist, p_idx, p_count, h_hist, h_idx, h_count);
+
+    while (keep_running) {
+        next_ns += PERIOD_NS;
+        sleep_until(next_ns);
+        if (!keep_running) break;
+
+        int rc = init_rc;
+        if (init_rc == 0) {
+            rc = bme280_read_sample(fd, &cal, &raw_t, &raw_h, &raw_p);
+        }
+
+        if (rc == 0) {
+            ma_add(&maT, raw_t);
+            ma_add(&maH, raw_h);
+            ma_add(&maP, raw_p);
+
+            sm_t = ma_mean(&maT);
+            sm_h = ma_mean(&maH);
+            sm_p = ma_mean(&maP);
+        } else {
+            total_errors++;
+#if FREEZE_SMOOTH_ON_ERROR
+            raw_t = NAN; raw_h = NAN; raw_p = NAN;
+#else
+            raw_t = NAN; raw_h = NAN; raw_p = NAN;
+            sm_t  = NAN; sm_h  = NAN; sm_p  = NAN;
+#endif
+            if (fd >= 0) {
+                int re = bme280_init(fd, &cal);
+                init_rc = (re == 0) ? 0 : re;
+            }
+        }
+
+        sample++;
+        format_time_ms(ts_buf, sizeof(ts_buf));
+
+        if (rc == 0) {
+            snprintf(line, sizeof(line),
+                     "#%llu %s RAW T=%6.2fC H=%6.2f%% P=%7.2fhPa | SMOOTH(%d) T=%6.2fC H=%6.2f%% P=%7.2fhPa",
+                     (unsigned long long)sample, ts_buf,
+                     raw_t, raw_h, raw_p,
+                     WINDOW, sm_t, sm_h, sm_p);
+        } else {
+            snprintf(line, sizeof(line),
+                     "#%llu %s RAW ERR(rc=%d) | SMOOTH(%d) T=%6.2fC H=%6.2f%% P=%7.2fhPa | errors=%llu",
+                     (unsigned long long)sample, ts_buf,
+                     rc, WINDOW, sm_t, sm_h, sm_p,
+                     (unsigned long long)total_errors);
+        }
+
+        fputs("\033[1;1H", stdout);
+        print_one_line_fixed(line);
+
+        tick_1hz--;
+        if (tick_1hz <= 0) {
+            tick_1hz = SAMPLE_HZ;
+
+            if (!isnan(sm_t) && !isnan(sm_p) && !isnan(sm_h)) {
+                hist_push(t_hist, &t_idx, &t_count, sm_t);
+                hist_push(p_hist, &p_idx, &p_count, sm_p);
+                hist_push(h_hist, &h_idx, &h_count, sm_h);
+            }
+
+            redraw_charts(t_hist, t_idx, t_count, p_hist, p_idx, p_count, h_hist, h_idx, h_count);
+        }
+    }
+
+    fputs("\033[?7h\033[?25h\033[H\033[J", stdout);
+    fflush(stdout);
+
+    if (fd >= 0) close(fd);
+    return 0;
+}
